@@ -203,6 +203,8 @@ class Recorder:
 
     # -- event handling ------------------------------------------------------------
     def on_message(self, raw: str | bytes, recv_us: int) -> None:
+        if self._closed:
+            return
         try:
             events = self.adapter.parse(raw, recv_us)
         except (AdapterError, ValueError, ArithmeticError) as exc:
@@ -255,7 +257,7 @@ class Recorder:
             log.debug("%s: %s", self.adapter.name, notice.text)
 
     def on_state(self, connected: bool, reason: str) -> None:
-        if connected:
+        if connected or self._closed:
             return
         now = self.clock()
         for state in self._states.values():
@@ -315,6 +317,8 @@ class Recorder:
             self._write_backfill(record, trades, error)
 
     def _write_backfill(self, record: GapRecord, trades: list[Trade], error: str) -> None:
+        if self._closed:
+            return
         state = self._states[record.symbol]
         if trades and state.backfill_writer is None:
             state.backfill_writer = self._writer(
@@ -362,6 +366,8 @@ class Recorder:
     # -- periodic work and lifecycle ---------------------------------------------------
     def tick(self) -> None:
         """Flush to disk, close bars whose interval has passed, rotate by age."""
+        if self._closed:
+            return
         now = self.clock()
         grace = int(self.config.bar_grace_s * 1_000_000)
         for state in self._states.values():
@@ -426,18 +432,24 @@ class Recorder:
                 if error is not None:
                     raise error
         finally:
-            for task in tasks:
-                task.cancel()
-            for task in tasks:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            self.close()
+            # Stop accepting events first, so nothing can reopen a segment after close().
+            self._closed = True
+            try:
+                for task in tasks:
+                    task.cancel()
+                for task in tasks:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            finally:
+                self.close()
         return self.summary
 
     def close(self) -> None:
-        """Flush everything and finalise every open segment. Safe to call twice."""
-        if self._closed:
-            return
+        """Flush everything and finalise every open segment.
+
+        Idempotent, and safe to call again if a previous call was interrupted (for example
+        by a KeyboardInterrupt on Python 3.10): every step is a no-op once done.
+        """
         self._closed = True
         now = self.clock()
         for state in self._states.values():
@@ -445,9 +457,11 @@ class Recorder:
             for builder, writer in state.builders:
                 for bar in builder.flush():
                     self._write_bar(writer, bar)
-                self.summary.late_trades += builder.late_trades
                 writer.finalize()
             state.trades.finalize()
             if state.backfill_writer is not None:
                 state.backfill_writer.finalize()
         self.gap_writer.finalize()
+        self.summary.late_trades = sum(
+            builder.late_trades for state in self._states.values() for builder, _ in state.builders
+        )

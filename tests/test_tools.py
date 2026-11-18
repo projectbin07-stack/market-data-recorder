@@ -20,10 +20,10 @@ from market_data_recorder.csvformat import (
 from market_data_recorder.models import Trade
 from market_data_recorder.rebuild import rebuild_bars
 from market_data_recorder.stats import compute_stats, format_stats, percentile
-from market_data_recorder.storage import Manifest, SegmentWriter, csv_header
+from market_data_recorder.storage import Manifest, SegmentWriter, csv_header, find_parts
 from market_data_recorder.verify import format_report, verify
 from recording import IDS, S, make_recording
-from samples import T0_US
+from samples import T0_US, binance_trade
 
 
 @pytest.fixture
@@ -40,7 +40,15 @@ def test_recorder_summary_counts_everything(tmp_path: Path) -> None:
     assert s.errors and "Invalid request" in s.errors[0]
     assert s.gaps == {"disconnect": 1, "sequence_jump": 1}
     assert s.bars["BTCUSDT"] == 3
-    recorder.close()  # idempotent
+    # After close, late events (e.g. a message delivered during shutdown) must not reopen
+    # a segment, and close() can safely run again.
+    recorder.on_message(binance_trade(31, "131", "1", T0_US + 155 * S), T0_US + 155 * S)
+    recorder.on_state(False, "late")
+    recorder.tick()
+    recorder.close()
+    assert find_parts(tmp_path) == []
+    assert recorder.summary.trades["BTCUSDT"] == 29
+    assert verify(tmp_path).ok
 
 
 def test_recorded_files_follow_tickreplay_rules(rec: Path) -> None:

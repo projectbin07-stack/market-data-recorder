@@ -75,8 +75,13 @@ def trade_segments(out: Path) -> int:
 
 
 def part_has_rows(out: Path) -> bool:
-    parts = [p for p in find_parts(out) if "trades-" in p.name]
-    return any(p.stat().st_size > 600 for p in parts)
+    for part in find_parts(out):
+        try:
+            if "trades-" in part.name and part.stat().st_size > 600:
+                return True
+        except FileNotFoundError:
+            continue  # renamed into place between listing and stat (the recorder is live)
+    return False
 
 
 def test_kill_mid_write_then_verify_and_salvage(tmp_path: Path) -> None:
